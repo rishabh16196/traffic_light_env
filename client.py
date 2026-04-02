@@ -69,6 +69,8 @@ class TrafficLightEnv(
             total_throughput=obs_data.get("total_throughput", 0),
             arrivals=obs_data.get("arrivals", [0, 0, 0, 0]),
             departures=obs_data.get("departures", [0, 0, 0, 0]),
+            grade_score=obs_data.get("grade_score"),
+            grade_details=obs_data.get("grade_details"),
             done=payload.get("done", False),
             reward=payload.get("reward"),
             metadata=obs_data.get("metadata", {}),
