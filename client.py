@@ -12,7 +12,13 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import NUM_DIRECTIONS, NUM_LANES, TrafficLightAction, TrafficLightObservation
+from .models import (
+    NUM_DIRECTIONS,
+    NUM_LANES,
+    VEHICLE_TYPE_NAMES,
+    TrafficLightAction,
+    TrafficLightObservation,
+)
 
 
 class TrafficLightEnv(
@@ -79,6 +85,18 @@ class TrafficLightEnv(
             # Per-lane detail
             lanes_100m=obs_data.get("lanes_100m", [0] * NUM_LANES),
             lanes_500m=obs_data.get("lanes_500m", [0] * NUM_LANES),
+            # Vehicle composition
+            vehicles_100m=obs_data.get(
+                "vehicles_100m",
+                {vt: [0] * NUM_DIRECTIONS for vt in VEHICLE_TYPE_NAMES},
+            ),
+            vehicles_500m=obs_data.get(
+                "vehicles_500m",
+                {vt: [0] * NUM_DIRECTIONS for vt in VEHICLE_TYPE_NAMES},
+            ),
+            # Dilemma zone
+            dilemma_risk=obs_data.get("dilemma_risk", 0.0),
+            total_dilemma_vehicles=obs_data.get("total_dilemma_vehicles", 0.0),
             # Grading
             grade_score=obs_data.get("grade_score"),
             grade_details=obs_data.get("grade_details"),

@@ -21,17 +21,15 @@ Light states per direction: red (0), yellow (1), green (2).
 When the agent switches phase, a mandatory yellow transition
 (YELLOW_DURATION steps) occurs — no departures during yellow.
 
-Phases (6):
-  0  NS+SN corridor — both north-south directions green
-  1  EW+WE corridor — both east-west directions green
-  2  NS only
-  3  SN only
-  4  EW only
-  5  WE only
+Vehicle types (car, suv, bus, truck, motorcycle) have real-world
+physics properties. When a phase switch triggers yellow, vehicles
+in the 100 m zone whose stopping distance exceeds their position
+are in the **dilemma zone** — they cannot safely stop.
 
-Tasks:
-  balanced, rush_hour_ns, rush_hour_ew, alternating_surge,
-  random_spikes, gridlock, emergency_vehicle
+Phases (6):
+  0  NS+SN corridor    1  EW+WE corridor
+  2  NS only           3  SN only
+  4  EW only           5  WE only
 """
 
 import math
@@ -44,6 +42,7 @@ from openenv.core.env_server.types import State
 
 try:
     from ..models import (
+        DILEMMA_FRACTIONS,
         DIR_EW,
         DIR_NS,
         DIR_SN,
@@ -56,12 +55,15 @@ try:
         NUM_LANES,
         NUM_PHASES,
         TASK_NAMES,
+        VEHICLE_TYPE_NAMES,
+        VEHICLE_TYPES,
         TrafficLightAction,
         TrafficLightObservation,
     )
     from .rubrics import TrafficLightRubric
 except ImportError:
     from models import (
+        DILEMMA_FRACTIONS,
         DIR_EW,
         DIR_NS,
         DIR_SN,
@@ -74,6 +76,8 @@ except ImportError:
         NUM_LANES,
         NUM_PHASES,
         TASK_NAMES,
+        VEHICLE_TYPE_NAMES,
+        VEHICLE_TYPES,
         TrafficLightAction,
         TrafficLightObservation,
     )
@@ -83,7 +87,6 @@ except ImportError:
 # Direction / lane / phase mappings
 # ---------------------------------------------------------------------------
 
-# Direction index → lane indices (2 lanes per direction)
 DIR_LANES: list[list[int]] = [
     [0, 1],  # NS
     [2, 3],  # SN
@@ -91,43 +94,39 @@ DIR_LANES: list[list[int]] = [
     [6, 7],  # WE
 ]
 
-# Phase → which directions get green
 PHASE_GREEN_DIRS: dict[int, list[int]] = {
-    0: [DIR_NS, DIR_SN],  # NS+SN corridor
-    1: [DIR_EW, DIR_WE],  # EW+WE corridor
-    2: [DIR_NS],           # NS only
-    3: [DIR_SN],           # SN only
-    4: [DIR_EW],           # EW only
-    5: [DIR_WE],           # WE only
+    0: [DIR_NS, DIR_SN],
+    1: [DIR_EW, DIR_WE],
+    2: [DIR_NS],
+    3: [DIR_SN],
+    4: [DIR_EW],
+    5: [DIR_WE],
 }
 
-# Lane → direction (derived)
 LANE_TO_DIR: list[int] = []
 for _d in range(NUM_DIRECTIONS):
     for _ in range(LANES_PER_DIRECTION):
         LANE_TO_DIR.append(_d)
 
-# Direction → which phases make it green
-DIR_TO_PHASES: dict[int, list[int]] = {d: [] for d in range(NUM_DIRECTIONS)}
-for _ph, _dirs in PHASE_GREEN_DIRS.items():
-    for _d in _dirs:
-        DIR_TO_PHASES[_d].append(_ph)
+# Spawn weights for random.choices
+_SPAWN_WEIGHTS: list[float] = [VEHICLE_TYPES[vt]["spawn_weight"] for vt in VEHICLE_TYPE_NAMES]
 
 # ---------------------------------------------------------------------------
 # Global config
 # ---------------------------------------------------------------------------
 
 MAX_STEPS = 200
-MIGRATION_RATE = 0.4    # fraction of 500 m vehicles that move to 100 m each step
-GREEN_THROUGHPUT = 3     # max vehicles departing a green lane's 100 m zone per step
-YELLOW_DURATION = 2      # steps of yellow before new green activates
-SWITCH_PENALTY = -2.0    # reward penalty when a yellow transition starts
-MAX_QUEUE_100M = 30      # cap per lane at 100 m
-MAX_QUEUE_500M = 40      # cap per lane at 500 m
-EMERGENCY_PENALTY = -5.0 # per-step penalty while emergency vehicle is waiting
+MIGRATION_RATE = 0.4
+GREEN_THROUGHPUT = 3
+YELLOW_DURATION = 2
+SWITCH_PENALTY = -2.0
+MAX_QUEUE_100M = 30
+MAX_QUEUE_500M = 40
+EMERGENCY_PENALTY = -5.0
+DILEMMA_PENALTY = -1.5   # per dilemma-zone vehicle
 
 # ---------------------------------------------------------------------------
-# Per-task arrival rates [NS, SN, EW, WE] (per direction, split across lanes)
+# Per-task arrival rates [NS, SN, EW, WE]
 # ---------------------------------------------------------------------------
 
 TASK_CONFIGS: dict[str, dict] = {
@@ -141,12 +140,12 @@ TASK_CONFIGS: dict[str, dict] = {
         "arrival_rates": [0.4, 0.4, 1.8, 2.0],
     },
     "alternating_surge": {
-        "arrival_rates": [0.8, 0.8, 0.8, 0.8],  # base; modified in step
+        "arrival_rates": [0.8, 0.8, 0.8, 0.8],
         "surge_period": 30,
         "surge_boost": 1.2,
     },
     "random_spikes": {
-        "arrival_rates": [0.8, 0.8, 0.8, 0.8],  # base; modified in step
+        "arrival_rates": [0.8, 0.8, 0.8, 0.8],
         "spike_prob": 0.08,
         "spike_duration": 5,
         "spike_rate": 3.0,
@@ -161,16 +160,18 @@ TASK_CONFIGS: dict[str, dict] = {
 }
 
 
+def _empty_type_counts() -> list[dict[str, int]]:
+    """Create empty per-lane vehicle-type count dicts."""
+    return [{vt: 0 for vt in VEHICLE_TYPE_NAMES} for _ in range(NUM_LANES)]
+
+
 class TrafficLightEnvironment(Environment):
     """
     RL environment for a single 4-way intersection traffic light.
 
-    The agent observes per-direction vehicle counts at 100 m and 500 m,
-    per-direction light states, then picks one of 6 green phases.
-    The goal is to minimize cumulative waiting.
-
-    Use reset(task="task_name") to select a scenario, or task="random"
-    to sample one uniformly.
+    Tracks individual vehicle types per lane with physics-based stopping
+    distances. Phase switches incur dilemma-zone risk when heavy or fast
+    vehicles cannot stop safely within the 100 m zone.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -179,11 +180,11 @@ class TrafficLightEnvironment(Environment):
         super().__init__(rubric=TrafficLightRubric())
         self._state = State(episode_id=str(uuid4()), step_count=0)
 
-        # Per-lane queues (8 lanes)
-        self._queues_100m: list[int] = [0] * NUM_LANES
-        self._queues_500m: list[int] = [0] * NUM_LANES
+        # Per-lane, per-type vehicle counts
+        self._veh_100m: list[dict[str, int]] = _empty_type_counts()
+        self._veh_500m: list[dict[str, int]] = _empty_type_counts()
 
-        # Per-direction light states (4 directions)
+        # Per-direction light states
         self._lights: list[int] = [LIGHT_RED] * NUM_DIRECTIONS
 
         # Phase state
@@ -192,6 +193,7 @@ class TrafficLightEnvironment(Environment):
         self._pending_phase: int = -1
         self._time_in_phase: int = 0
         self._total_throughput: int = 0
+        self._total_dilemma: float = 0.0
         self._rng = random.Random()
 
         # Task state
@@ -199,14 +201,24 @@ class TrafficLightEnvironment(Environment):
         self._task_config: dict = TASK_CONFIGS["balanced"]
 
         # Emergency vehicle state
-        self._emergency_lane: int = -1       # specific lane (0-7), -1 = none
-        self._emergency_direction: int = -1  # direction (0-3), -1 = none
+        self._emergency_lane: int = -1
+        self._emergency_direction: int = -1
         self._emergency_wait: int = 0
         self._emergency_cleared: bool = False
 
         # Random spikes state
         self._spike_direction: int = -1
         self._spike_remaining: int = 0
+
+    # ------------------------------------------------------------------
+    # Convenience: lane totals from type dicts
+    # ------------------------------------------------------------------
+
+    def _lane_total(self, zone: list[dict[str, int]], lane: int) -> int:
+        return sum(zone[lane].values())
+
+    def _dir_total(self, zone: list[dict[str, int]], d: int) -> int:
+        return sum(self._lane_total(zone, ln) for ln in DIR_LANES[d])
 
     # ------------------------------------------------------------------
     # reset
@@ -218,7 +230,6 @@ class TrafficLightEnvironment(Environment):
         episode_id: Optional[str] = None,
         task: Optional[str] = None,
     ) -> TrafficLightObservation:
-        """Reset the intersection."""
         self._state = State(
             episode_id=episode_id or str(uuid4()), step_count=0
         )
@@ -237,8 +248,8 @@ class TrafficLightEnvironment(Environment):
         self._task_config = TASK_CONFIGS[self._task_name]
 
         # Reset queues
-        self._queues_100m = [0] * NUM_LANES
-        self._queues_500m = [0] * NUM_LANES
+        self._veh_100m = _empty_type_counts()
+        self._veh_500m = _empty_type_counts()
 
         # Start with NS+SN corridor green (phase 0)
         self._active_phase = 0
@@ -248,18 +259,18 @@ class TrafficLightEnvironment(Environment):
         self._pending_phase = -1
         self._time_in_phase = 0
         self._total_throughput = 0
+        self._total_dilemma = 0.0
 
-        # Reset emergency state
+        # Reset emergency
         self._emergency_lane = -1
         self._emergency_direction = -1
         self._emergency_wait = 0
         self._emergency_cleared = False
 
-        # Reset spike state
+        # Reset spike
         self._spike_direction = -1
         self._spike_remaining = 0
 
-        # Reset rubric for new episode
         self._reset_rubric()
 
         return self._build_observation(
@@ -268,6 +279,7 @@ class TrafficLightEnvironment(Environment):
             done=False,
             reward=0.0,
             switched=False,
+            dilemma_risk=0.0,
         )
 
     # ------------------------------------------------------------------
@@ -275,21 +287,10 @@ class TrafficLightEnvironment(Environment):
     # ------------------------------------------------------------------
 
     def step(self, action: TrafficLightAction) -> TrafficLightObservation:  # type: ignore[override]
-        """
-        Advance one timestep.
-
-        Order of operations:
-        1. Process phase/yellow transition logic based on agent action.
-        2. Depart vehicles from 100 m zone of green directions.
-        3. Migrate vehicles from 500 m zone to 100 m zone.
-        4. Compute arrival rates for current task/step.
-        5. Arrive new vehicles at 500 m zone.
-        6. Update emergency vehicle state.
-        7. Compute reward.
-        """
         self._state.step_count += 1
         desired_phase = action.phase
         switched = False
+        dilemma_risk = 0.0
 
         # --- 1. Phase transition logic ---
         if self._yellow_remaining > 0:
@@ -301,67 +302,78 @@ class TrafficLightEnvironment(Environment):
                 self._set_lights_for_phase(self._active_phase)
         elif desired_phase != self._active_phase:
             switched = True
+            # Compute dilemma-zone risk BEFORE changing lights
+            prev_green_dirs = PHASE_GREEN_DIRS.get(self._active_phase, [])
+            dilemma_risk = self._compute_dilemma_risk(prev_green_dirs)
+            self._total_dilemma += dilemma_risk
+
             self._yellow_remaining = YELLOW_DURATION
             self._pending_phase = desired_phase
             self._time_in_phase = 0
-            # Set currently-green directions to yellow
-            for d in PHASE_GREEN_DIRS.get(self._active_phase, []):
+            for d in prev_green_dirs:
                 self._lights[d] = LIGHT_YELLOW
             self._active_phase = -1
         else:
             self._time_in_phase += 1
 
-        # --- 2. Departures (only from green directions' lanes) ---
+        # --- 2. Departures (green directions only) ---
         departures_per_lane = [0] * NUM_LANES
         for d in range(NUM_DIRECTIONS):
             if self._lights[d] == LIGHT_GREEN:
                 for lane in DIR_LANES[d]:
-                    depart = min(self._queues_100m[lane], GREEN_THROUGHPUT)
+                    lane_total = self._lane_total(self._veh_100m, lane)
+                    depart = min(lane_total, GREEN_THROUGHPUT)
                     departures_per_lane[lane] = depart
-                    self._queues_100m[lane] -= depart
+                    self._remove_vehicles(self._veh_100m, lane, depart)
                     self._total_throughput += depart
 
-        # Aggregate departures per direction
-        departures = [0] * NUM_DIRECTIONS
-        for d in range(NUM_DIRECTIONS):
-            for lane in DIR_LANES[d]:
-                departures[d] += departures_per_lane[lane]
+        departures = self._aggregate_per_dir(departures_per_lane)
 
-        # --- 3. Migration: 500 m → 100 m ---
+        # --- 3. Migration: 500 m → 100 m (per type) ---
         for lane in range(NUM_LANES):
-            if self._queues_500m[lane] > 0:
-                migrate = self._binomial(self._queues_500m[lane], MIGRATION_RATE)
-                migrate = min(migrate, MAX_QUEUE_100M - self._queues_100m[lane])
-                self._queues_500m[lane] -= migrate
-                self._queues_100m[lane] += migrate
+            cap = MAX_QUEUE_100M - self._lane_total(self._veh_100m, lane)
+            if cap <= 0:
+                continue
+            for vt in VEHICLE_TYPE_NAMES:
+                count_500 = self._veh_500m[lane][vt]
+                if count_500 > 0 and cap > 0:
+                    migrate = min(self._binomial(count_500, MIGRATION_RATE), cap)
+                    self._veh_500m[lane][vt] -= migrate
+                    self._veh_100m[lane][vt] += migrate
+                    cap -= migrate
 
-        # --- 4. Compute effective arrival rates for this step ---
+        # --- 4. Arrival rates ---
         dir_rates = self._get_arrival_rates()
 
-        # --- 5. Arrivals at 500 m zone (Poisson, split across lanes) ---
+        # --- 5. Arrivals at 500 m zone ---
         arrivals_per_lane = [0] * NUM_LANES
         for d in range(NUM_DIRECTIONS):
             lane_rate = dir_rates[d] / LANES_PER_DIRECTION
             for lane in DIR_LANES[d]:
-                n_arrive = self._poisson(lane_rate)
+                cap = MAX_QUEUE_500M - self._lane_total(self._veh_500m, lane)
+                n_arrive = min(self._poisson(lane_rate), cap)
                 arrivals_per_lane[lane] = n_arrive
-                self._queues_500m[lane] = min(
-                    self._queues_500m[lane] + n_arrive, MAX_QUEUE_500M
-                )
+                # Assign vehicle types
+                if n_arrive > 0:
+                    types = self._rng.choices(
+                        VEHICLE_TYPE_NAMES, weights=_SPAWN_WEIGHTS, k=n_arrive
+                    )
+                    for vt in types:
+                        self._veh_500m[lane][vt] += 1
 
-        # Aggregate arrivals per direction
-        arrivals = [0] * NUM_DIRECTIONS
-        for d in range(NUM_DIRECTIONS):
-            for lane in DIR_LANES[d]:
-                arrivals[d] += arrivals_per_lane[lane]
+        arrivals = self._aggregate_per_dir(arrivals_per_lane)
 
-        # --- 6. Emergency vehicle logic ---
+        # --- 6. Emergency vehicle ---
         self._update_emergency(departures_per_lane)
 
         # --- 7. Reward ---
-        reward = -float(sum(self._queues_100m)) - 0.3 * float(sum(self._queues_500m))
+        q100 = sum(self._lane_total(self._veh_100m, ln) for ln in range(NUM_LANES))
+        q500 = sum(self._lane_total(self._veh_500m, ln) for ln in range(NUM_LANES))
+        reward = -float(q100) - 0.3 * float(q500)
         if switched:
             reward += SWITCH_PENALTY
+        if dilemma_risk > 0:
+            reward += DILEMMA_PENALTY * dilemma_risk
         if self._emergency_lane >= 0:
             reward += EMERGENCY_PENALTY
 
@@ -373,9 +385,10 @@ class TrafficLightEnvironment(Environment):
             done=done,
             reward=reward,
             switched=switched,
+            dilemma_risk=dilemma_risk,
         )
 
-        # Apply rubric — accumulates trajectory and grades on terminal step
+        # Rubric grading on terminal step
         grade_reward = self._apply_rubric(action, obs)
         if done and self.rubric is not None:
             obs.grade_score = round(grade_reward, 4)
@@ -384,11 +397,32 @@ class TrafficLightEnvironment(Environment):
         return obs
 
     # ------------------------------------------------------------------
+    # Dilemma zone computation
+    # ------------------------------------------------------------------
+
+    def _compute_dilemma_risk(self, green_dirs: list[int]) -> float:
+        """Compute dilemma-zone risk for directions turning from green to yellow.
+
+        For each vehicle type in each green lane's 100 m zone, the fraction
+        at risk equals stopping_distance / 100 m.  We assume vehicles are
+        uniformly distributed within the zone.
+
+        Returns total expected dilemma-zone vehicles (float).
+        """
+        risk = 0.0
+        for d in green_dirs:
+            for lane in DIR_LANES[d]:
+                for vt in VEHICLE_TYPE_NAMES:
+                    count = self._veh_100m[lane][vt]
+                    if count > 0:
+                        risk += count * DILEMMA_FRACTIONS[vt]
+        return round(risk, 2)
+
+    # ------------------------------------------------------------------
     # Task-specific arrival rate logic
     # ------------------------------------------------------------------
 
     def _get_arrival_rates(self) -> list[float]:
-        """Return per-direction arrival rates for the current step."""
         base = list(self._task_config["arrival_rates"])
         step = self._state.step_count
 
@@ -421,13 +455,11 @@ class TrafficLightEnvironment(Environment):
     # ------------------------------------------------------------------
 
     def _update_emergency(self, departures_per_lane: list[int]) -> None:
-        """Manage emergency vehicle appearance and clearance."""
         if self._task_name != "emergency_vehicle":
             return
 
         appear_step = self._task_config["emergency_appear_step"]
 
-        # Spawn the emergency vehicle at the designated step
         if (
             self._state.step_count == appear_step
             and self._emergency_lane < 0
@@ -436,9 +468,9 @@ class TrafficLightEnvironment(Environment):
             self._emergency_lane = self._rng.randint(0, NUM_LANES - 1)
             self._emergency_direction = LANE_TO_DIR[self._emergency_lane]
             self._emergency_wait = 0
-            self._queues_100m[self._emergency_lane] += 1
+            # Emergency vehicle is always a car (trained driver, fast reaction)
+            self._veh_100m[self._emergency_lane]["car"] += 1
 
-        # If emergency vehicle is active, check if it departed
         if self._emergency_lane >= 0:
             if departures_per_lane[self._emergency_lane] > 0:
                 self._emergency_cleared = True
@@ -449,19 +481,63 @@ class TrafficLightEnvironment(Environment):
                 self._emergency_wait += 1
 
     # ------------------------------------------------------------------
+    # Vehicle removal (proportional to type distribution)
+    # ------------------------------------------------------------------
+
+    def _remove_vehicles(
+        self, zone: list[dict[str, int]], lane: int, count: int
+    ) -> None:
+        """Remove `count` vehicles from a lane, proportional to type mix."""
+        total = self._lane_total(zone, lane)
+        if total == 0 or count == 0:
+            return
+        remaining = count
+        # First pass: proportional removal
+        for vt in VEHICLE_TYPE_NAMES:
+            if remaining <= 0:
+                break
+            type_count = zone[lane][vt]
+            remove = min(type_count, round(count * type_count / total))
+            remove = min(remove, remaining)
+            zone[lane][vt] -= remove
+            remaining -= remove
+        # Second pass: remove any remainder
+        for vt in VEHICLE_TYPE_NAMES:
+            if remaining <= 0:
+                break
+            avail = zone[lane][vt]
+            take = min(avail, remaining)
+            zone[lane][vt] -= take
+            remaining -= take
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _aggregate_per_dir(self, per_lane: list[int]) -> list[int]:
+        result = [0] * NUM_DIRECTIONS
+        for d in range(NUM_DIRECTIONS):
+            for lane in DIR_LANES[d]:
+                result[d] += per_lane[lane]
+        return result
 
     def _set_lights_for_phase(self, phase: int) -> None:
         green_dirs = PHASE_GREEN_DIRS.get(phase, [])
         for d in range(NUM_DIRECTIONS):
             self._lights[d] = LIGHT_GREEN if d in green_dirs else LIGHT_RED
 
-    def _dir_queue_100m(self, d: int) -> int:
-        return sum(self._queues_100m[lane] for lane in DIR_LANES[d])
-
-    def _dir_queue_500m(self, d: int) -> int:
-        return sum(self._queues_500m[lane] for lane in DIR_LANES[d])
+    def _dir_type_counts(
+        self, zone: list[dict[str, int]]
+    ) -> dict[str, list[int]]:
+        """Aggregate per-type counts per direction."""
+        result: dict[str, list[int]] = {
+            vt: [0] * NUM_DIRECTIONS for vt in VEHICLE_TYPE_NAMES
+        }
+        for d in range(NUM_DIRECTIONS):
+            for lane in DIR_LANES[d]:
+                for vt in VEHICLE_TYPE_NAMES:
+                    result[vt][d] += zone[lane][vt]
+        return result
 
     def _build_observation(
         self,
@@ -470,46 +546,48 @@ class TrafficLightEnvironment(Environment):
         done: bool,
         reward: float,
         switched: bool,
+        dilemma_risk: float,
     ) -> TrafficLightObservation:
-        total_waiting = sum(self._queues_100m) + sum(self._queues_500m)
+        lanes_100m = [self._lane_total(self._veh_100m, ln) for ln in range(NUM_LANES)]
+        lanes_500m = [self._lane_total(self._veh_500m, ln) for ln in range(NUM_LANES)]
+        total_waiting = sum(lanes_100m) + sum(lanes_500m)
+
         return TrafficLightObservation(
             task_name=self._task_name,
-            # Per-direction 100 m totals
-            ns_100m=self._dir_queue_100m(DIR_NS),
-            sn_100m=self._dir_queue_100m(DIR_SN),
-            ew_100m=self._dir_queue_100m(DIR_EW),
-            we_100m=self._dir_queue_100m(DIR_WE),
-            # Per-direction 500 m totals
-            ns_500m=self._dir_queue_500m(DIR_NS),
-            sn_500m=self._dir_queue_500m(DIR_SN),
-            ew_500m=self._dir_queue_500m(DIR_EW),
-            we_500m=self._dir_queue_500m(DIR_WE),
-            # Per-direction lights
+            ns_100m=self._dir_total(self._veh_100m, DIR_NS),
+            sn_100m=self._dir_total(self._veh_100m, DIR_SN),
+            ew_100m=self._dir_total(self._veh_100m, DIR_EW),
+            we_100m=self._dir_total(self._veh_100m, DIR_WE),
+            ns_500m=self._dir_total(self._veh_500m, DIR_NS),
+            sn_500m=self._dir_total(self._veh_500m, DIR_SN),
+            ew_500m=self._dir_total(self._veh_500m, DIR_EW),
+            we_500m=self._dir_total(self._veh_500m, DIR_WE),
             light_ns=self._lights[DIR_NS],
             light_sn=self._lights[DIR_SN],
             light_ew=self._lights[DIR_EW],
             light_we=self._lights[DIR_WE],
-            # Emergency
             emergency_direction=self._emergency_direction,
             emergency_lane=self._emergency_lane,
             emergency_wait=self._emergency_wait,
-            # Phase / timing
             active_phase=self._active_phase,
             yellow_remaining=self._yellow_remaining,
             time_in_phase=self._time_in_phase,
             step_number=self._state.step_count,
-            # Aggregates
             total_waiting=total_waiting,
             total_throughput=self._total_throughput,
             arrivals=arrivals,
             departures=departures,
-            # Per-lane detail
-            lanes_100m=list(self._queues_100m),
-            lanes_500m=list(self._queues_500m),
+            lanes_100m=lanes_100m,
+            lanes_500m=lanes_500m,
+            vehicles_100m=self._dir_type_counts(self._veh_100m),
+            vehicles_500m=self._dir_type_counts(self._veh_500m),
+            dilemma_risk=dilemma_risk,
+            total_dilemma_vehicles=round(self._total_dilemma, 2),
             done=done,
             reward=reward,
             metadata={
                 "switched": switched,
+                "dilemma_risk": dilemma_risk,
                 "lights": list(self._lights),
                 "emergency_direction": self._emergency_direction,
                 "emergency_lane": self._emergency_lane,

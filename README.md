@@ -88,15 +88,42 @@ The agent selects one of 6 phases each step:
 
 Corridor phases (0, 1) green 4 lanes for maximum throughput. Single-direction phases (2-5) are useful when one direction is much busier than its opposite. Switching phases triggers a mandatory **2-step yellow transition**.
 
+### Vehicle Types and Stopping Physics
+
+Each vehicle is randomly assigned a type with real-world physics properties:
+
+| Type | Speed | Reaction Time | Deceleration | Stopping Distance | Dilemma Fraction | Spawn Weight |
+|---|---|---|---|---|---|---|
+| Car | 50 km/h | 1.0 s | 6.8 m/s² | 28.1 m | 28.1% | 40% |
+| SUV | 50 km/h | 1.2 s | 6.0 m/s² | 32.7 m | 32.7% | 25% |
+| Bus | 40 km/h | 1.5 s | 4.5 m/s² | 30.4 m | 30.4% | 10% |
+| Truck | 45 km/h | 1.4 s | 4.0 m/s² | 37.0 m | 37.0% | 15% |
+| Motorcycle | 55 km/h | 0.8 s | 7.5 m/s² | 27.8 m | 27.8% | 10% |
+
+**Stopping distance** = reaction distance + braking distance:
+- `d_reaction = speed × reaction_time`
+- `d_braking = speed² / (2 × deceleration)`
+
+Assumes dry urban road conditions (friction coefficient ~0.7).
+
+### Dilemma Zone
+
+When the agent switches phases (green → yellow), vehicles in the 100 m zone whose stopping distance exceeds their position from the intersection are in the **dilemma zone** — they cannot safely stop in time. The risk is computed assuming vehicles are uniformly distributed within the zone:
+
+`dilemma_vehicles = Σ (vehicle_count × stopping_distance / 100)`
+
+This creates a key strategic tension: switching phases clears different queues but puts vehicles at risk. The agent must balance **throughput** (clearing queues) against **safety** (avoiding dilemma-zone incidents), especially when heavy vehicles (trucks, buses) are in the green lanes.
+
 ### Step Mechanics
 
 Each timestep:
 1. Process phase/yellow transition based on agent's action
-2. Depart up to 3 vehicles per green lane from the 100 m zone
-3. Migrate 40% of 500 m vehicles to 100 m zone
-4. Arrive new vehicles at 500 m zone (Poisson-distributed per lane)
-5. Update emergency vehicle state (if applicable)
-6. Compute reward
+2. **If switching**: compute dilemma-zone risk for previously-green directions
+3. Depart up to 3 vehicles per green lane from the 100 m zone
+4. Migrate 40% of 500 m vehicles to 100 m zone
+5. Arrive new vehicles at 500 m zone (Poisson-distributed per lane, random type)
+6. Update emergency vehicle state (if applicable)
+7. Compute reward
 
 ### Reward Signal
 
@@ -104,6 +131,7 @@ Per-step reward (used for RL training):
 - `-1.0` per vehicle in any 100 m zone
 - `-0.3` per vehicle in any 500 m zone
 - `-2.0` penalty when switching phases
+- `-1.5` per dilemma-zone vehicle (on phase switch)
 - `-5.0` per step while an emergency vehicle is waiting
 
 ## Tasks
@@ -137,19 +165,21 @@ obs.grade_details  # Full breakdown dict
 
 ### Grading Components
 
-**Standard tasks** (50/50 weighting):
+**Standard tasks** (40/40/20 weighting):
 
 | Component | Weight | Metric |
 |---|---|---|
-| Waiting score | 50% | Average vehicles waiting per step (lower is better) |
-| Throughput score | 50% | Total vehicles cleared over episode (higher is better) |
+| Waiting score | 40% | Average vehicles waiting per step (lower is better) |
+| Throughput score | 40% | Total vehicles cleared over episode (higher is better) |
+| Safety score | 20% | Cumulative dilemma-zone vehicles (lower is better, 0=perfect, 50+=fail) |
 
-**Emergency vehicle task** (35/25/40 weighting):
+**Emergency vehicle task** (25/20/15/40 weighting):
 
 | Component | Weight | Metric |
 |---|---|---|
-| Waiting score | 35% | Average vehicles waiting per step |
-| Throughput score | 25% | Total vehicles cleared |
+| Waiting score | 25% | Average vehicles waiting per step |
+| Throughput score | 20% | Total vehicles cleared |
+| Safety score | 15% | Cumulative dilemma-zone vehicles |
 | Emergency score | 40% | How quickly the emergency vehicle was cleared |
 
 ### Per-Task Thresholds
@@ -178,21 +208,37 @@ A score >= **0.5** is considered **passed**.
 
 ## Baseline Scores
 
-Scores from the heuristic baseline (corridor phase selection favoring the busier axis, with emergency priority). Seed=42, 200 steps per episode.
+Two baselines compared — fixed-timer (switches every 10 steps) and smart heuristic (adaptive). Seed=42, 200 steps per episode.
 
-| Task | Score | Waiting | Throughput | Emergency | Result |
-|---|---|---|---|---|---|
-| `balanced` | 0.7492 | 0.498 | 1.000 | — | PASS |
-| `rush_hour_ns` | 0.8794 | 0.759 | 1.000 | — | PASS |
-| `rush_hour_ew` | 0.8719 | 0.744 | 1.000 | — | PASS |
-| `alternating_surge` | 0.6728 | 0.346 | 1.000 | — | PASS |
-| `random_spikes` | 0.8383 | 0.677 | 1.000 | — | PASS |
-| `gridlock` | 0.7039 | 0.408 | 1.000 | — | PASS |
-| `emergency_vehicle` | 0.8501 | 0.572 | 1.000 | 1.000 | PASS |
+### Fixed 10-step timer (best overall baseline)
 
-**Average: 0.7837**
+| Task | Score | Waiting | Throughput | Safety | Emergency | Dilemma | Result |
+|---|---|---|---|---|---|---|---|
+| `balanced` | 0.8314 | 0.671 | 1.000 | 0.815 | — | 9.25 | PASS |
+| `rush_hour_ns` | 0.6906 | 0.409 | 1.000 | 0.636 | — | 18.22 | PASS |
+| `rush_hour_ew` | 0.7710 | 0.534 | 1.000 | 0.786 | — | 10.68 | PASS |
+| `alternating_surge` | 0.8103 | 0.791 | 1.000 | 0.469 | — | 26.54 | PASS |
+| `random_spikes` | 0.8132 | 0.630 | 1.000 | 0.806 | — | 9.72 | PASS |
+| `gridlock` | 0.8482 | 1.000 | 1.000 | 0.241 | — | 37.96 | PASS |
+| `emergency_vehicle` | 0.8845 | 0.701 | 1.000 | 0.729 | 1.000 | 13.54 | PASS |
 
-The hardest tasks (`alternating_surge`, `gridlock`) score lowest, leaving room for LLM-driven improvement. A naive policy (always phase 0) or random policy fails most tasks.
+**Average: 0.807**
+
+### Smart heuristic (adaptive, switches on demand)
+
+| Task | Score | Waiting | Throughput | Safety | Emergency | Dilemma | Result |
+|---|---|---|---|---|---|---|---|
+| `balanced` | 0.6032 | 0.508 | 1.000 | 0.000 | — | 208.16 | PASS |
+| `rush_hour_ns` | 0.7545 | 0.727 | 1.000 | 0.319 | — | 34.05 | PASS |
+| `rush_hour_ew` | 0.7772 | 0.754 | 1.000 | 0.378 | — | 31.09 | PASS |
+| `alternating_surge` | 0.5906 | 0.477 | 1.000 | 0.000 | — | 409.59 | PASS |
+| `random_spikes` | 0.6448 | 0.612 | 1.000 | 0.000 | — | 125.39 | PASS |
+| `gridlock` | 0.5334 | 0.334 | 1.000 | 0.000 | — | 1989.23 | PASS |
+| `emergency_vehicle` | 0.6932 | 0.373 | 1.000 | 0.000 | 1.000 | 297.64 | PASS |
+
+**Average: 0.657**
+
+The smart heuristic switches too often, causing massive dilemma-zone incidents (up to 1989 vehicles on gridlock). The fixed timer is safer but can't adapt to asymmetric traffic. An LLM agent that reasons about both traffic patterns and vehicle composition should outperform both.
 
 ## Observation
 
@@ -215,6 +261,10 @@ The `TrafficLightObservation` provides:
 | `departures` | Vehicles departed this step per direction |
 | `lanes_100m` | Per-lane 100 m queues (8 values) |
 | `lanes_500m` | Per-lane 500 m queues (8 values) |
+| `vehicles_100m` | Per-type, per-direction counts at 100 m (`{"car": [ns,sn,ew,we], ...}`) |
+| `vehicles_500m` | Per-type, per-direction counts at 500 m |
+| `dilemma_risk` | Dilemma-zone vehicles this step (0.0 if no switch) |
+| `total_dilemma_vehicles` | Cumulative dilemma-zone vehicles this episode |
 | `step_number` | Current step (0-200) |
 | `done` | Whether the episode is over |
 | `reward` | Per-step reward signal |

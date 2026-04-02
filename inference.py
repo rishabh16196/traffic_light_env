@@ -72,12 +72,24 @@ SYSTEM_PROMPT = textwrap.dedent(
     Phase switching incurs a 2-step yellow transition (no departures) and a -2.0
     reward penalty. Avoid unnecessary switching.
 
+    SAFETY: Each lane has a mix of vehicle types (car, suv, bus, truck, motorcycle)
+    with different stopping distances based on real physics. When you switch phases,
+    vehicles in the 100m zone that can't stop in time are in the "dilemma zone":
+    - Trucks: 37m stopping distance (37% of 100m zone at risk)
+    - SUVs: 33m (33% at risk)
+    - Buses: 30m (30% at risk)
+    - Cars: 28m (28% at risk)
+    - Motorcycles: 28m (28% at risk)
+    Each dilemma-zone vehicle incurs a -1.5 reward penalty. Avoid switching when
+    many heavy vehicles (trucks, buses) are in the green lanes' 100m zones.
+
     Strategy tips:
     - Corridor phases (0, 1) green 4 lanes at once — high throughput.
-    - Single-direction phases (2-5) are useful when one direction is much busier.
+    - Single-direction phases (2-5) useful when one direction is much busier.
     - Consider 500m vehicles: they migrate to 100m soon.
     - For emergency vehicles, prioritize the direction containing the emergency.
-    - Avoid rapid switching — the yellow transition wastes 2 steps.
+    - Avoid switching when trucks/buses are in the 100m zone (high dilemma risk).
+    - Minimize total switches — each costs yellow time + dilemma risk + penalty.
 
     Respond with ONLY a single digit: 0, 1, 2, 3, 4, or 5
     """
@@ -130,9 +142,19 @@ def obs_to_summary(obs: Any) -> str:
         f"Total waiting: {obs.total_waiting}",
         f"Throughput so far: {obs.total_throughput}",
     ]
+    # Show heavy vehicle counts in 100m zone (dilemma risk factors)
+    v100 = obs.vehicles_100m
+    heavy = {d: 0 for d in range(4)}
+    dir_labels = ["NS", "SN", "EW", "WE"]
+    for vt in ("truck", "bus", "suv"):
+        for d in range(4):
+            heavy[d] += v100.get(vt, [0, 0, 0, 0])[d]
+    heavy_str = " ".join(f"{dir_labels[d]}:{heavy[d]}" for d in range(4))
+    lines.append(f"Heavy vehicles (truck+bus+suv) at 100m — {heavy_str}")
+    lines.append(f"Cumulative dilemma-zone vehicles: {obs.total_dilemma_vehicles:.1f}")
+
     if obs.emergency_direction >= 0:
         dir_name = DIRECTION_NAMES[obs.emergency_direction].upper()
-        # Which phases green this direction?
         if obs.emergency_direction <= 1:
             phases_help = "phase 0 (corridor) or phase " + str(obs.emergency_direction + 2)
         else:

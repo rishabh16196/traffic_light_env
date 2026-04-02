@@ -56,6 +56,69 @@ PHASE_NAMES = [
     "we_only",         # 5: west-to-east only
 ]
 
+# ---------------------------------------------------------------------------
+# Vehicle types with real-world physics
+# ---------------------------------------------------------------------------
+# Stopping distance = d_reaction + d_braking
+#   d_reaction = speed_ms × reaction_time_s
+#   d_braking  = speed_ms² / (2 × deceleration_ms2)
+# Assumes dry urban road (friction coefficient ≈ 0.7).
+
+VEHICLE_TYPES: Dict[str, Dict[str, float]] = {
+    "car": {
+        "speed_kmh": 50.0,
+        "reaction_time_s": 1.0,
+        "deceleration_ms2": 6.8,   # standard passenger car, dry road
+        "spawn_weight": 0.40,
+    },
+    "suv": {
+        "speed_kmh": 50.0,
+        "reaction_time_s": 1.2,
+        "deceleration_ms2": 6.0,   # higher center of gravity, slightly worse braking
+        "spawn_weight": 0.25,
+    },
+    "bus": {
+        "speed_kmh": 40.0,
+        "reaction_time_s": 1.5,
+        "deceleration_ms2": 4.5,   # heavy, pneumatic brakes, longer reaction
+        "spawn_weight": 0.10,
+    },
+    "truck": {
+        "speed_kmh": 45.0,
+        "reaction_time_s": 1.4,
+        "deceleration_ms2": 4.0,   # heaviest, longest stopping distance
+        "spawn_weight": 0.15,
+    },
+    "motorcycle": {
+        "speed_kmh": 55.0,
+        "reaction_time_s": 0.8,
+        "deceleration_ms2": 7.5,   # light, good brakes, alert rider
+        "spawn_weight": 0.10,
+    },
+}
+
+VEHICLE_TYPE_NAMES: List[str] = list(VEHICLE_TYPES.keys())
+
+
+def stopping_distance(vtype: str) -> float:
+    """Compute total stopping distance in metres for a vehicle type."""
+    props = VEHICLE_TYPES[vtype]
+    v = props["speed_kmh"] / 3.6  # km/h → m/s
+    d_react = v * props["reaction_time_s"]
+    d_brake = v ** 2 / (2.0 * props["deceleration_ms2"])
+    return d_react + d_brake
+
+
+# Pre-computed stopping distances (metres) and dilemma-zone fractions
+# Dilemma fraction = stopping_distance / 100 m (clamped to [0, 1])
+# Vehicles within this fraction of the 100 m zone can't stop safely.
+STOPPING_DISTANCES: Dict[str, float] = {
+    vt: round(stopping_distance(vt), 1) for vt in VEHICLE_TYPE_NAMES
+}
+DILEMMA_FRACTIONS: Dict[str, float] = {
+    vt: min(STOPPING_DISTANCES[vt] / 100.0, 1.0) for vt in VEHICLE_TYPE_NAMES
+}
+
 # Available task names
 TASK_NAMES = [
     "balanced",
@@ -171,6 +234,30 @@ class TrafficLightObservation(Observation):
     lanes_500m: List[int] = Field(
         default_factory=lambda: [0] * NUM_LANES,
         description="Per-lane 500 m queue counts (8 lanes)",
+    )
+
+    # Vehicle type composition per direction at 100 m
+    # Keys: vehicle type name, Values: list of 4 ints [NS, SN, EW, WE]
+    vehicles_100m: Dict[str, List[int]] = Field(
+        default_factory=lambda: {vt: [0] * NUM_DIRECTIONS for vt in VEHICLE_TYPE_NAMES},
+        description="Per-type, per-direction vehicle counts at 100 m zone",
+    )
+    vehicles_500m: Dict[str, List[int]] = Field(
+        default_factory=lambda: {vt: [0] * NUM_DIRECTIONS for vt in VEHICLE_TYPE_NAMES},
+        description="Per-type, per-direction vehicle counts at 500 m zone",
+    )
+
+    # Dilemma zone — physics-based safety metric
+    dilemma_risk: float = Field(
+        default=0.0,
+        description=(
+            "Number of vehicles in the dilemma zone this step (can't stop safely "
+            "after phase switch). 0.0 when no switch occurred."
+        ),
+    )
+    total_dilemma_vehicles: float = Field(
+        default=0.0,
+        description="Cumulative dilemma-zone vehicles across the episode",
     )
 
     # Grading (populated on final step when done=True)

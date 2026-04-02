@@ -83,11 +83,13 @@ class TrafficLightRubric(TrajectoryRubric):
     Accumulates (action, observation) pairs over the episode and computes
     a 0.0-1.0 score at episode end based on task-specific criteria:
 
-    - **Waiting score** (weight 0.5): How well the agent minimized average
+    - **Waiting score** (weight 0.40): How well the agent minimized average
       queue length across the episode.
-    - **Throughput score** (weight 0.5): How many vehicles the agent cleared.
-    - For **emergency_vehicle** task, the weights shift to 0.35 / 0.25 / 0.40
-      to account for emergency clearance speed.
+    - **Throughput score** (weight 0.40): How many vehicles the agent cleared.
+    - **Safety score** (weight 0.20): How well the agent avoided dilemma-zone
+      incidents (vehicles that can't stop safely on phase switch).
+    - For **emergency_vehicle** task, the weights shift to
+      0.25 / 0.20 / 0.15 / 0.40 to account for emergency clearance speed.
     """
 
     def __init__(self) -> None:
@@ -109,6 +111,7 @@ class TrafficLightRubric(TrajectoryRubric):
         avg_waiting = waiting_sum / len(trajectory)
 
         total_throughput = float(getattr(final_obs, "total_throughput", 0))
+        total_dilemma = float(getattr(final_obs, "total_dilemma_vehicles", 0.0))
 
         # --- Score components ---
         perf_w, fail_w = thresholds["avg_waiting"]
@@ -117,12 +120,17 @@ class TrafficLightRubric(TrajectoryRubric):
         perf_t, fail_t = thresholds["throughput"]
         throughput_score = _linear_score(total_throughput, perf_t, fail_t)
 
+        # Safety: fewer dilemma vehicles = better
+        # Perfect: 0 dilemma vehicles; Fail: 50+ dilemma vehicles
+        safety_score = _linear_score(total_dilemma, 0.0, 50.0)
+
         # --- Task-specific weighting ---
         if task_name == "emergency_vehicle":
             emergency_score = self._grade_emergency(trajectory)
             final_score = (
-                0.35 * waiting_score
-                + 0.25 * throughput_score
+                0.25 * waiting_score
+                + 0.20 * throughput_score
+                + 0.15 * safety_score
                 + 0.40 * emergency_score
             )
             self._grade_details = {
@@ -130,20 +138,28 @@ class TrafficLightRubric(TrajectoryRubric):
                 "score": round(final_score, 4),
                 "waiting_score": round(waiting_score, 4),
                 "throughput_score": round(throughput_score, 4),
+                "safety_score": round(safety_score, 4),
                 "emergency_score": round(emergency_score, 4),
                 "avg_waiting": round(avg_waiting, 2),
                 "total_throughput": int(total_throughput),
+                "total_dilemma_vehicles": round(total_dilemma, 2),
                 "passed": final_score >= 0.5,
             }
         else:
-            final_score = 0.5 * waiting_score + 0.5 * throughput_score
+            final_score = (
+                0.40 * waiting_score
+                + 0.40 * throughput_score
+                + 0.20 * safety_score
+            )
             self._grade_details = {
                 "task": task_name,
                 "score": round(final_score, 4),
                 "waiting_score": round(waiting_score, 4),
                 "throughput_score": round(throughput_score, 4),
+                "safety_score": round(safety_score, 4),
                 "avg_waiting": round(avg_waiting, 2),
                 "total_throughput": int(total_throughput),
+                "total_dilemma_vehicles": round(total_dilemma, 2),
                 "passed": final_score >= 0.5,
             }
 
