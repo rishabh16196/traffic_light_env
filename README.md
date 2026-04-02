@@ -13,43 +13,39 @@ tags:
 
 # Traffic Light Env Environment
 
-An RL environment simulating a 4-way traffic intersection where an AI agent controls the traffic light to minimize vehicle waiting time. Features 7 task scenarios with increasing difficulty, realistic traffic dynamics, and automated grading rubrics.
+An RL environment simulating a 4-way traffic intersection where an AI agent controls the traffic light to minimize vehicle waiting time. The intersection has 4 traffic-flow directions (NS, SN, EW, WE), each with 2 lanes (8 lanes total), and 6 selectable green phases. Features 7 task scenarios with increasing difficulty and automated grading rubrics.
 
 ## Quick Start
 
 ```python
 from traffic_light_env import TrafficLightAction, TrafficLightEnv
 
-with TrafficLightEnv(base_url="http://localhost:8000") as env:
-    obs = env.reset(task="balanced")
+async with TrafficLightEnv(base_url="http://localhost:8000") as env:
+    result = await env.reset(task="balanced")
+    obs = result.observation
 
     for step in range(200):
-        # Choose phase based on which direction has more waiting vehicles
-        ns_load = obs.north_100m + obs.south_100m
-        ew_load = obs.east_100m + obs.west_100m
-        phase = 0 if ns_load >= ew_load else 1
+        # Choose phase based on which axis has more waiting vehicles
+        ns_sn = obs.ns_100m + obs.sn_100m
+        ew_we = obs.ew_100m + obs.we_100m
+        phase = 0 if ns_sn >= ew_we else 1  # corridor phases
 
-        result = env.step(TrafficLightAction(phase=phase))
+        result = await env.step(TrafficLightAction(phase=phase))
         obs = result.observation
 
         if obs.done:
-            print(f"Episode finished!")
-            print(f"  Grade: {obs.grade_score}")
-            print(f"  Passed: {obs.grade_details['passed']}")
-            print(f"  Avg waiting: {obs.grade_details['avg_waiting']}")
-            print(f"  Throughput: {obs.grade_details['total_throughput']}")
+            print(f"Grade: {obs.grade_score}")
+            print(f"Passed: {obs.grade_details['passed']}")
             break
 ```
 
 ### From Docker
 
 ```python
-from traffic_light_env import TrafficLightAction, TrafficLightEnv
-
-env = TrafficLightEnv.from_docker_image("traffic_light_env-env:latest")
-obs = env.reset(task="gridlock")
+env = await TrafficLightEnv.from_docker_image("traffic_light_env-env:latest")
+result = await env.reset(task="gridlock")
 # ... run episode ...
-env.close()
+await env.close()
 ```
 
 ## Building the Docker Image
@@ -62,35 +58,51 @@ docker build -t traffic_light_env-env:latest -f server/Dockerfile .
 
 ### Intersection Model
 
-A single 4-way intersection with lanes: North, South, East, West.
+A single 4-way intersection with **4 traffic-flow directions**, each with **2 lanes**:
 
-Each lane has two observation zones:
-- **100m zone**: Vehicles near the stop line, ready to depart on green (max 30 per lane)
-- **500m zone**: Vehicles approaching, migrating toward 100m each step (max 40 per lane)
+| Direction | Code | Description |
+|---|---|---|
+| NS | `DIR_NS = 0` | North → South (lanes 0, 1) |
+| SN | `DIR_SN = 1` | South → North (lanes 2, 3) |
+| EW | `DIR_EW = 2` | East → West (lanes 4, 5) |
+| WE | `DIR_WE = 3` | West → East (lanes 6, 7) |
 
-### Agent Actions
+Each of the 8 lanes has two observation zones:
+- **100 m zone**: Vehicles near the stop line, ready to depart on green (max 30 per lane)
+- **500 m zone**: Vehicles approaching, migrating toward 100 m each step (max 40 per lane)
 
-The agent picks one of two phases each step:
-- **Phase 0**: North-South green, East-West red
-- **Phase 1**: East-West green, North-South red
+Each direction has its own traffic light (red/yellow/green).
 
-Switching phases triggers a mandatory **2-step yellow transition** where no vehicles can depart.
+### Agent Actions — 6 Phases
+
+The agent selects one of 6 phases each step:
+
+| Phase | Green Directions | Lanes Green | Description |
+|---|---|---|---|
+| **0** | NS + SN | 4 | Full north-south corridor |
+| **1** | EW + WE | 4 | Full east-west corridor |
+| **2** | NS only | 2 | North-to-south only |
+| **3** | SN only | 2 | South-to-north only |
+| **4** | EW only | 2 | East-to-west only |
+| **5** | WE only | 2 | West-to-east only |
+
+Corridor phases (0, 1) green 4 lanes for maximum throughput. Single-direction phases (2-5) are useful when one direction is much busier than its opposite. Switching phases triggers a mandatory **2-step yellow transition**.
 
 ### Step Mechanics
 
 Each timestep:
 1. Process phase/yellow transition based on agent's action
-2. Depart up to 3 vehicles per green lane from the 100m zone
-3. Migrate 40% of 500m vehicles to 100m zone
-4. Arrive new vehicles at 500m zone (Poisson-distributed)
+2. Depart up to 3 vehicles per green lane from the 100 m zone
+3. Migrate 40% of 500 m vehicles to 100 m zone
+4. Arrive new vehicles at 500 m zone (Poisson-distributed per lane)
 5. Update emergency vehicle state (if applicable)
 6. Compute reward
 
 ### Reward Signal
 
 Per-step reward (used for RL training):
-- `-1.0` per vehicle in the 100m zone
-- `-0.3` per vehicle in the 500m zone
+- `-1.0` per vehicle in any 100 m zone
+- `-0.3` per vehicle in any 500 m zone
 - `-2.0` penalty when switching phases
 - `-5.0` per step while an emergency vehicle is waiting
 
@@ -99,22 +111,24 @@ Per-step reward (used for RL training):
 Seven scenarios with increasing difficulty, selected at reset:
 
 ```python
-obs = env.reset(task="balanced")    # or "random" for a random task
+result = await env.reset(task="balanced")    # or "random" for a random task
 ```
 
-| Task | Difficulty | Traffic Pattern |
-|---|---|---|
-| `balanced` | Easy | Equal rates (0.5) all directions |
-| `rush_hour_ns` | Medium | Heavy N/S (1.2, 1.0), light E/W (0.2, 0.2) |
-| `rush_hour_ew` | Medium | Heavy E/W (1.0, 1.2), light N/S (0.2, 0.2) |
-| `alternating_surge` | Hard | Surges alternate N/S and E/W every 30 steps |
-| `random_spikes` | Hard | Random bursts on random lanes |
-| `gridlock` | Very Hard | All directions heavy (1.0) |
-| `emergency_vehicle` | Hard | Normal traffic + emergency vehicle at step 10 |
+| Task | Difficulty | Arrival Rates [NS, SN, EW, WE] | Notes |
+|---|---|---|---|
+| `balanced` | Easy | [1.0, 1.0, 1.0, 1.0] | Equal traffic all directions |
+| `rush_hour_ns` | Medium | [2.0, 1.8, 0.4, 0.4] | Heavy north-south corridor |
+| `rush_hour_ew` | Medium | [0.4, 0.4, 1.8, 2.0] | Heavy east-west corridor |
+| `alternating_surge` | Hard | [0.8, 0.8, 0.8, 0.8] + surges | NS/SN and EW/WE surge alternately every 30 steps |
+| `random_spikes` | Hard | [0.8, 0.8, 0.8, 0.8] + spikes | Random bursts on random directions |
+| `gridlock` | Very Hard | [2.0, 2.0, 2.0, 2.0] | All directions heavy |
+| `emergency_vehicle` | Hard | [1.0, 1.0, 1.0, 1.0] + emergency | Emergency vehicle spawns at step 10 |
+
+Arrival rates are per direction; each lane receives half the direction rate.
 
 ## Grading
 
-Each episode is automatically graded on a **0.0-1.0 scale** when the episode ends (step 200). The grade is returned in the terminal observation:
+Each episode is automatically graded on a **0.0-1.0 scale** at step 200. The grade is returned in the terminal observation:
 
 ```python
 obs.grade_score    # 0.0 - 1.0
@@ -140,17 +154,15 @@ obs.grade_details  # Full breakdown dict
 
 ### Per-Task Thresholds
 
-Each task has difficulty-appropriate thresholds for a perfect (1.0) vs failing (0.0) score:
-
 | Task | Perfect avg_waiting | Fail avg_waiting | Perfect throughput | Fail throughput |
 |---|---|---|---|---|
-| `balanced` | <= 4 | >= 20 | >= 180 | <= 60 |
-| `rush_hour_ns` | <= 8 | >= 25 | >= 200 | <= 80 |
-| `rush_hour_ew` | <= 8 | >= 25 | >= 200 | <= 80 |
-| `alternating_surge` | <= 10 | >= 30 | >= 180 | <= 60 |
-| `random_spikes` | <= 10 | >= 30 | >= 160 | <= 50 |
-| `gridlock` | <= 15 | >= 40 | >= 250 | <= 100 |
-| `emergency_vehicle` | <= 4 | >= 20 | >= 180 | <= 60 |
+| `balanced` | <= 15 | >= 70 | >= 700 | <= 250 |
+| `rush_hour_ns` | <= 15 | >= 60 | >= 800 | <= 300 |
+| `rush_hour_ew` | <= 15 | >= 60 | >= 800 | <= 300 |
+| `alternating_surge` | <= 30 | >= 120 | >= 800 | <= 300 |
+| `random_spikes` | <= 15 | >= 60 | >= 600 | <= 200 |
+| `gridlock` | <= 100 | >= 500 | >= 800 | <= 350 |
+| `emergency_vehicle` | <= 15 | >= 70 | >= 700 | <= 250 |
 
 A score >= **0.5** is considered **passed**.
 
@@ -164,55 +176,55 @@ A score >= **0.5** is considered **passed**.
 | 30 steps | 0.1 |
 | Not cleared | 0.0 |
 
+## Baseline Scores
+
+Scores from the heuristic baseline (corridor phase selection favoring the busier axis, with emergency priority). Seed=42, 200 steps per episode.
+
+| Task | Score | Waiting | Throughput | Emergency | Result |
+|---|---|---|---|---|---|
+| `balanced` | 0.7492 | 0.498 | 1.000 | — | PASS |
+| `rush_hour_ns` | 0.8794 | 0.759 | 1.000 | — | PASS |
+| `rush_hour_ew` | 0.8719 | 0.744 | 1.000 | — | PASS |
+| `alternating_surge` | 0.6728 | 0.346 | 1.000 | — | PASS |
+| `random_spikes` | 0.8383 | 0.677 | 1.000 | — | PASS |
+| `gridlock` | 0.7039 | 0.408 | 1.000 | — | PASS |
+| `emergency_vehicle` | 0.8501 | 0.572 | 1.000 | 1.000 | PASS |
+
+**Average: 0.7837**
+
+The hardest tasks (`alternating_surge`, `gridlock`) score lowest, leaving room for LLM-driven improvement. A naive policy (always phase 0) or random policy fails most tasks.
+
 ## Observation
 
 The `TrafficLightObservation` provides:
 
 | Field | Description |
 |---|---|
-| `north_100m`, `south_100m`, `east_100m`, `west_100m` | Vehicles within 100m per lane |
-| `north_500m`, `south_500m`, `east_500m`, `west_500m` | Vehicles between 100-500m per lane |
-| `light_north`, `light_south`, `light_east`, `light_west` | Per-lane light state (0=red, 1=yellow, 2=green) |
-| `active_phase` | Current green direction (0=NS, 1=EW, -1=yellow) |
+| `ns_100m`, `sn_100m`, `ew_100m`, `we_100m` | Per-direction 100 m queue totals (sum of 2 lanes) |
+| `ns_500m`, `sn_500m`, `ew_500m`, `we_500m` | Per-direction 500 m queue totals |
+| `light_ns`, `light_sn`, `light_ew`, `light_we` | Per-direction light state (0=red, 1=yellow, 2=green) |
+| `active_phase` | Current phase 0-5 (-1 during yellow) |
 | `yellow_remaining` | Steps left in yellow transition |
 | `time_in_phase` | Steps since last phase change |
-| `emergency_lane` | Lane with emergency vehicle (-1=none) |
+| `emergency_direction` | Direction with emergency vehicle (0-3, -1=none) |
+| `emergency_lane` | Specific lane (0-7, -1=none) |
 | `emergency_wait` | Steps the emergency vehicle has waited |
 | `total_waiting` | Total vehicles across all zones |
 | `total_throughput` | Cumulative vehicles cleared |
-| `arrivals` | Vehicles arrived this step [N, S, E, W] |
-| `departures` | Vehicles departed this step [N, S, E, W] |
+| `arrivals` | Vehicles arrived this step per direction [NS, SN, EW, WE] |
+| `departures` | Vehicles departed this step per direction |
+| `lanes_100m` | Per-lane 100 m queues (8 values) |
+| `lanes_500m` | Per-lane 500 m queues (8 values) |
 | `step_number` | Current step (0-200) |
 | `done` | Whether the episode is over |
 | `reward` | Per-step reward signal |
 | `grade_score` | Final grade 0.0-1.0 (only on terminal step) |
 | `grade_details` | Grading breakdown dict (only on terminal step) |
 
-## Baseline Scores
-
-Scores from the heuristic baseline (greedy phase selection favoring the busier direction, with emergency lane priority). Seed=42, 200 steps per episode.
-
-| Task | Score | Waiting | Throughput | Emergency | Result |
-|---|---|---|---|---|---|
-| `balanced` | 0.5647 | 0.1294 | 1.0000 | — | PASS |
-| `rush_hour_ns` | 0.7907 | 0.5815 | 1.0000 | — | PASS |
-| `rush_hour_ew` | 0.8099 | 0.6197 | 1.0000 | — | PASS |
-| `alternating_surge` | 0.5000 | 0.0000 | 1.0000 | — | PASS |
-| `random_spikes` | 0.6689 | 0.3377 | 1.0000 | — | PASS |
-| `gridlock` | 0.5000 | 0.0000 | 1.0000 | — | PASS |
-| `emergency_vehicle` | 0.7960 | 0.4172 | 1.0000 | 1.0000 | PASS |
-
-**Average: 0.6615**
-
-The hardest tasks (`alternating_surge`, `gridlock`) score 0.50 — barely passing — leaving significant room for LLM-driven improvement. The `inference.py` script uses an LLM to make phase decisions, with the heuristic as a fallback.
-
 ## Deploying to Hugging Face Spaces
 
 ```bash
-# Push to your namespace
 openenv push
-
-# Push to a specific repo as private
 openenv push --repo-id my-org/traffic-light-env --private
 ```
 
@@ -234,22 +246,6 @@ uvicorn server.app:app --reload
 
 The server supports multiple concurrent WebSocket connections (configured in `server/app.py` via `max_concurrent_envs`).
 
-```python
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(task: str):
-    with TrafficLightEnv(base_url="http://localhost:8000") as env:
-        obs = env.reset(task=task)
-        for _ in range(200):
-            result = env.step(TrafficLightAction(phase=0))
-            obs = result.observation
-            if obs.done:
-                return task, obs.grade_score
-
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, ["balanced", "gridlock", "rush_hour_ns", "emergency_vehicle"]))
-```
-
 ## Project Structure
 
 ```
@@ -257,9 +253,10 @@ traffic_light_env/
 ├── openenv.yaml           # OpenEnv manifest
 ├── pyproject.toml         # Project metadata and dependencies
 ├── uv.lock                # Locked dependencies
+├── inference.py           # Baseline inference script (LLM agent)
 ├── __init__.py            # Module exports
 ├── client.py              # TrafficLightEnv client (HTTP/WebSocket)
-├── models.py              # Action, Observation, and constants
+├── models.py              # Action, Observation, constants
 └── server/
     ├── app.py             # FastAPI application
     ├── traffic_light_env_environment.py  # Core simulation logic

@@ -24,10 +24,10 @@ STDOUT FORMAT
 
   Example:
     [START] task=balanced env=traffic_light_env model=Qwen2.5-72B-Instruct
-    [STEP] step=1 action=phase(0) reward=-1.20 done=false error=null
-    [STEP] step=2 action=phase(1) reward=-3.50 done=false error=null
+    [STEP] step=1 action=phase(0) reward=-2.40 done=false error=null
+    [STEP] step=2 action=phase(1) reward=-5.10 done=false error=null
     ...
-    [END] success=true steps=200 score=0.624 rewards=-1.20,-3.50,...
+    [END] success=true steps=200 score=0.624 rewards=-2.40,-5.10,...
 """
 
 import asyncio
@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from traffic_light_env import TrafficLightAction, TrafficLightEnv
-from traffic_light_env.models import TASK_NAMES
+from traffic_light_env.models import DIRECTION_NAMES, NUM_PHASES, TASK_NAMES
 
 IMAGE_NAME = os.getenv("IMAGE_NAME")
 API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
@@ -55,26 +55,38 @@ TASKS = os.getenv("TRAFFIC_LIGHT_TASKS", ",".join(TASK_NAMES)).split(",")
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are controlling a traffic light at a 4-way intersection. Your goal is to
-    minimize total vehicle waiting time by choosing the optimal green phase each step.
+    You are controlling a traffic light at a 4-way intersection with 4 directions
+    (NS=north-to-south, SN=south-to-north, EW=east-to-west, WE=west-to-east),
+    each with 2 lanes (8 lanes total).
 
-    Actions:
-      0 = North-South green (East-West red)
-      1 = East-West green (North-South red)
+    Your goal: minimize total vehicle waiting time by choosing the optimal phase.
 
-    Switching phases incurs a 2-step yellow transition (no departures) and a -2.0
+    Available phases (pick one number 0-5):
+      0 = NS+SN corridor (both north-south directions green)
+      1 = EW+WE corridor (both east-west directions green)
+      2 = NS only green
+      3 = SN only green
+      4 = EW only green
+      5 = WE only green
+
+    Phase switching incurs a 2-step yellow transition (no departures) and a -2.0
     reward penalty. Avoid unnecessary switching.
 
     Strategy tips:
-    - Keep the phase green for the direction with more waiting vehicles.
-    - Consider 500m vehicles: they will arrive at 100m soon.
-    - For emergency vehicles, prioritize clearing the emergency lane quickly (-5.0 per step penalty).
+    - Corridor phases (0, 1) green 4 lanes at once — high throughput.
+    - Single-direction phases (2-5) are useful when one direction is much busier.
+    - Consider 500m vehicles: they migrate to 100m soon.
+    - For emergency vehicles, prioritize the direction containing the emergency.
     - Avoid rapid switching — the yellow transition wastes 2 steps.
 
-    Respond with ONLY a single digit: 0 or 1
+    Respond with ONLY a single digit: 0, 1, 2, 3, 4, or 5
     """
 ).strip()
 
+
+# ---------------------------------------------------------------------------
+# Logging helpers (mandatory format)
+# ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -97,27 +109,44 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
+# ---------------------------------------------------------------------------
+# Observation → LLM prompt
+# ---------------------------------------------------------------------------
+
 def obs_to_summary(obs: Any) -> str:
     """Build a concise text summary of the current observation for the LLM."""
+    phase_desc = {
+        0: "NS+SN corridor", 1: "EW+WE corridor",
+        2: "NS only", 3: "SN only", 4: "EW only", 5: "WE only",
+    }
     lines = [
         f"Step: {obs.step_number}/{MAX_STEPS}",
         f"Task: {obs.task_name}",
-        f"Active phase: {obs.active_phase} ({'NS green' if obs.active_phase == 0 else 'EW green' if obs.active_phase == 1 else 'yellow transition'})",
+        f"Active phase: {obs.active_phase} ({phase_desc.get(obs.active_phase, 'yellow transition')})",
         f"Yellow remaining: {obs.yellow_remaining}",
         f"Time in phase: {obs.time_in_phase}",
-        f"100m queues — N:{obs.north_100m} S:{obs.south_100m} E:{obs.east_100m} W:{obs.west_100m}",
-        f"500m queues — N:{obs.north_500m} S:{obs.south_500m} E:{obs.east_500m} W:{obs.west_500m}",
+        f"100m queues — NS:{obs.ns_100m} SN:{obs.sn_100m} EW:{obs.ew_100m} WE:{obs.we_100m}",
+        f"500m queues — NS:{obs.ns_500m} SN:{obs.sn_500m} EW:{obs.ew_500m} WE:{obs.we_500m}",
         f"Total waiting: {obs.total_waiting}",
         f"Throughput so far: {obs.total_throughput}",
     ]
-    if obs.emergency_lane >= 0:
-        lane_name = ["North", "South", "East", "West"][obs.emergency_lane]
-        phase_needed = 0 if obs.emergency_lane in (0, 1) else 1
+    if obs.emergency_direction >= 0:
+        dir_name = DIRECTION_NAMES[obs.emergency_direction].upper()
+        # Which phases green this direction?
+        if obs.emergency_direction <= 1:
+            phases_help = "phase 0 (corridor) or phase " + str(obs.emergency_direction + 2)
+        else:
+            phases_help = "phase 1 (corridor) or phase " + str(obs.emergency_direction + 2)
         lines.append(
-            f"EMERGENCY vehicle in {lane_name} lane (needs phase {phase_needed}), waiting {obs.emergency_wait} steps"
+            f"EMERGENCY vehicle in {dir_name} direction (use {phases_help}), "
+            f"waiting {obs.emergency_wait} steps"
         )
     return "\n".join(lines)
 
+
+# ---------------------------------------------------------------------------
+# LLM decision
+# ---------------------------------------------------------------------------
 
 def get_phase_from_llm(
     client: OpenAI,
@@ -128,7 +157,7 @@ def get_phase_from_llm(
     user_prompt = obs_to_summary(obs)
     if history:
         user_prompt += "\n\nRecent history:\n" + "\n".join(history[-5:])
-    user_prompt += "\n\nChoose phase (0 or 1):"
+    user_prompt += "\n\nChoose phase (0-5):"
 
     try:
         completion = client.chat.completions.create(
@@ -142,27 +171,35 @@ def get_phase_from_llm(
             stream=False,
         )
         text = (completion.choices[0].message.content or "").strip()
-        # Extract the first 0 or 1 from the response
         for ch in text:
-            if ch in ("0", "1"):
+            if ch in "012345":
                 return int(ch)
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
 
-    # Fallback heuristic: pick the direction with more 100m vehicles
     return heuristic_phase(obs)
 
 
 def heuristic_phase(obs: Any) -> int:
-    """Simple heuristic: green the direction with more waiting vehicles."""
-    # If emergency vehicle is active, prioritize its lane
-    if obs.emergency_lane >= 0:
-        return 0 if obs.emergency_lane in (0, 1) else 1
+    """Heuristic baseline: corridor for the busier axis, or target emergency."""
+    # Emergency: green the direction containing the emergency vehicle
+    if obs.emergency_direction >= 0:
+        d = obs.emergency_direction
+        # Use corridor if possible (0 for NS/SN, 1 for EW/WE)
+        if d <= 1:
+            return 0  # NS+SN corridor
+        else:
+            return 1  # EW+WE corridor
 
-    ns = obs.north_100m + obs.south_100m + 0.3 * (obs.north_500m + obs.south_500m)
-    ew = obs.east_100m + obs.west_100m + 0.3 * (obs.east_500m + obs.west_500m)
-    return 0 if ns >= ew else 1
+    # Compare NS+SN axis vs EW+WE axis (100m weighted 1.0, 500m weighted 0.3)
+    ns_sn = (obs.ns_100m + obs.sn_100m) + 0.3 * (obs.ns_500m + obs.sn_500m)
+    ew_we = (obs.ew_100m + obs.we_100m) + 0.3 * (obs.ew_500m + obs.we_500m)
+    return 0 if ns_sn >= ew_we else 1
 
+
+# ---------------------------------------------------------------------------
+# Episode runner
+# ---------------------------------------------------------------------------
 
 async def run_task(client: OpenAI, env: TrafficLightEnv, task: str) -> Dict[str, Any]:
     """Run a single task episode and return results."""
@@ -208,7 +245,6 @@ async def run_task(client: OpenAI, env: TrafficLightEnv, task: str) -> Dict[str,
             )
 
             if done:
-                # Extract grade from terminal observation
                 score = obs.grade_score if obs.grade_score is not None else 0.0
                 success = score >= 0.5
                 break
@@ -224,6 +260,10 @@ async def run_task(client: OpenAI, env: TrafficLightEnv, task: str) -> Dict[str,
         "grade_details": obs.grade_details if hasattr(obs, "grade_details") else None,
     }
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
@@ -253,7 +293,10 @@ async def main() -> None:
                 f"  [{status}] {r['task']:22s} score={r['score']:.4f} steps={r['steps']}",
                 flush=True,
             )
-        avg_score = sum(r["score"] for r in all_results) / len(all_results) if all_results else 0.0
+        avg_score = (
+            sum(r["score"] for r in all_results) / len(all_results)
+            if all_results else 0.0
+        )
         print(f"  Average score: {avg_score:.4f}", flush=True)
 
     finally:
