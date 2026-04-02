@@ -3,10 +3,10 @@ Inference Script — Traffic Light Environment
 ===================================
 MANDATORY
 - Before submitting, ensure the following variables are defined in your environment configuration:
-    API_BASE_URL   The API endpoint for the LLM.
-    MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
-    LOCAL_IMAGE_NAME The name of the local image to use for the environment if you are using from_docker_image()
+    OPENAI_API_KEY   Your API key (also accepts HF_TOKEN or API_KEY as fallbacks).
+    API_BASE_URL     The API endpoint for the LLM.
+    MODEL_NAME       The model identifier to use for inference.
+    IMAGE_NAME       The name of the local image to use for the environment if you are using from_docker_image()
 
 - Defaults are set only for API_BASE_URL and MODEL_NAME:
     API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -31,7 +31,6 @@ STDOUT FORMAT
 """
 
 import asyncio
-import json
 import os
 import textwrap
 from typing import Any, Dict, List, Optional
@@ -42,7 +41,7 @@ from traffic_light_env import TrafficLightAction, TrafficLightEnv
 from traffic_light_env.models import TASK_NAMES
 
 IMAGE_NAME = os.getenv("IMAGE_NAME")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"

@@ -188,6 +188,24 @@ The `TrafficLightObservation` provides:
 | `grade_score` | Final grade 0.0-1.0 (only on terminal step) |
 | `grade_details` | Grading breakdown dict (only on terminal step) |
 
+## Baseline Scores
+
+Scores from the heuristic baseline (greedy phase selection favoring the busier direction, with emergency lane priority). Seed=42, 200 steps per episode.
+
+| Task | Score | Waiting | Throughput | Emergency | Result |
+|---|---|---|---|---|---|
+| `balanced` | 0.5647 | 0.1294 | 1.0000 | — | PASS |
+| `rush_hour_ns` | 0.7907 | 0.5815 | 1.0000 | — | PASS |
+| `rush_hour_ew` | 0.8099 | 0.6197 | 1.0000 | — | PASS |
+| `alternating_surge` | 0.5000 | 0.0000 | 1.0000 | — | PASS |
+| `random_spikes` | 0.6689 | 0.3377 | 1.0000 | — | PASS |
+| `gridlock` | 0.5000 | 0.0000 | 1.0000 | — | PASS |
+| `emergency_vehicle` | 0.7960 | 0.4172 | 1.0000 | 1.0000 | PASS |
+
+**Average: 0.6615**
+
+The hardest tasks (`alternating_surge`, `gridlock`) score 0.50 — barely passing — leaving significant room for LLM-driven improvement. The `inference.py` script uses an LLM to make phase decisions, with the heuristic as a fallback.
+
 ## Deploying to Hugging Face Spaces
 
 ```bash
