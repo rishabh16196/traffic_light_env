@@ -38,7 +38,13 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from traffic_light_env import TrafficLightAction, TrafficLightEnv
-from traffic_light_env.models import DIRECTION_NAMES, NUM_PHASES, TASK_NAMES
+from traffic_light_env.models import (
+    DILEMMA_FRACTIONS,
+    DIRECTION_NAMES,
+    NUM_PHASES,
+    TASK_NAMES,
+    VEHICLE_TYPE_NAMES,
+)
 
 IMAGE_NAME = os.getenv("IMAGE_NAME")
 API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
@@ -47,51 +53,45 @@ API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 BENCHMARK = "traffic_light_env"
 MAX_STEPS = 200
-TEMPERATURE = 0.3
-MAX_TOKENS = 64
+TEMPERATURE = 0.2
+MAX_TOKENS = 128
+
+# Strategy parameters
+MIN_HOLD_TIME = 8          # Minimum steps to hold a phase before considering switch
+SWITCH_THRESHOLD = 1.8     # Opposing axis must be this many times busier to switch
+LLM_CONSULT_INTERVAL = 10  # Ask LLM every N steps for strategic guidance
+EMERGENCY_OVERRIDE = True  # Immediately switch for emergency vehicles
 
 # Tasks to run. Override with TRAFFIC_LIGHT_TASKS env var (comma-separated).
 TASKS = os.getenv("TRAFFIC_LIGHT_TASKS", ",".join(TASK_NAMES)).split(",")
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are controlling a traffic light at a 4-way intersection with 4 directions
-    (NS=north-to-south, SN=south-to-north, EW=east-to-west, WE=west-to-east),
-    each with 2 lanes (8 lanes total).
+    You are a traffic light controller at a 4-way intersection. 4 directions
+    (NS, SN, EW, WE) with 2 lanes each (8 total). You pick one of 6 phases:
 
-    Your goal: minimize total vehicle waiting time by choosing the optimal phase.
+    0 = NS+SN corridor (4 lanes green — best throughput for N-S axis)
+    1 = EW+WE corridor (4 lanes green — best throughput for E-W axis)
+    2 = NS only   3 = SN only   4 = EW only   5 = WE only
 
-    Available phases (pick one number 0-5):
-      0 = NS+SN corridor (both north-south directions green)
-      1 = EW+WE corridor (both east-west directions green)
-      2 = NS only green
-      3 = SN only green
-      4 = EW only green
-      5 = WE only green
+    CRITICAL RULES — switching phases costs 2 dead steps (yellow) + dilemma-zone
+    risk (vehicles that can't stop safely). Every unnecessary switch HURTS your score.
 
-    Phase switching incurs a 2-step yellow transition (no departures) and a -2.0
-    reward penalty. Avoid unnecessary switching.
+    DECISION FRAMEWORK:
+    1. If currently in yellow transition → keep the pending phase (no choice).
+    2. If emergency vehicle present → switch to its corridor ONCE, then hold.
+    3. If held current phase < 8 steps → KEEP current phase (too early to switch).
+    4. Only switch if opposing axis queue is >1.8× current axis queue.
+    5. Prefer corridor phases (0 or 1) for maximum throughput.
+    6. Use single-direction phases (2-5) ONLY if one direction has >3× its opposite.
 
-    SAFETY: Each lane has a mix of vehicle types (car, suv, bus, truck, motorcycle)
-    with different stopping distances based on real physics. When you switch phases,
-    vehicles in the 100m zone that can't stop in time are in the "dilemma zone":
-    - Trucks: 37m stopping distance (37% of 100m zone at risk)
-    - SUVs: 33m (33% at risk)
-    - Buses: 30m (30% at risk)
-    - Cars: 28m (28% at risk)
-    - Motorcycles: 28m (28% at risk)
-    Each dilemma-zone vehicle incurs a -1.5 reward penalty. Avoid switching when
-    many heavy vehicles (trucks, buses) are in the green lanes' 100m zones.
+    Scoring: 40% waiting (lower=better), 40% throughput (higher=better), 20% safety
+    (fewer dilemma vehicles=better). The fixed-timer baseline scores 0.81 by switching
+    every 10 steps. You should switch LESS often than that on balanced traffic.
 
-    Strategy tips:
-    - Corridor phases (0, 1) green 4 lanes at once — high throughput.
-    - Single-direction phases (2-5) useful when one direction is much busier.
-    - Consider 500m vehicles: they migrate to 100m soon.
-    - For emergency vehicles, prioritize the direction containing the emergency.
-    - Avoid switching when trucks/buses are in the 100m zone (high dilemma risk).
-    - Minimize total switches — each costs yellow time + dilemma risk + penalty.
-
-    Respond with ONLY a single digit: 0, 1, 2, 3, 4, or 5
+    Respond: one line with the phase digit (0-5), then a brief reason.
+    Format: <digit> <reason>
+    Example: 0 NS+SN corridor has more vehicles, hold current phase
     """
 ).strip()
 
@@ -122,6 +122,127 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 
 # ---------------------------------------------------------------------------
+# Dilemma risk estimation
+# ---------------------------------------------------------------------------
+
+def estimate_dilemma_risk(obs: Any, green_dirs: List[int]) -> float:
+    """Estimate how many vehicles would be in the dilemma zone if we switch now."""
+    v100 = obs.vehicles_100m
+    dir_labels = ["NS", "SN", "EW", "WE"]
+    risk = 0.0
+    for d in green_dirs:
+        for vt in VEHICLE_TYPE_NAMES:
+            count = v100.get(vt, [0, 0, 0, 0])[d]
+            if count > 0:
+                risk += count * DILEMMA_FRACTIONS[vt]
+    return risk
+
+
+def get_green_dirs(phase: int) -> List[int]:
+    """Return which directions are green for a given phase."""
+    mapping = {0: [0, 1], 1: [2, 3], 2: [0], 3: [1], 4: [2], 5: [3]}
+    return mapping.get(phase, [])
+
+
+# ---------------------------------------------------------------------------
+# Smart heuristic (primary decision maker)
+# ---------------------------------------------------------------------------
+
+def smart_heuristic(obs: Any, current_phase: int, time_in_phase: int) -> int:
+    """
+    Heuristic that minimizes switching while maintaining good throughput.
+    Key insight: the fixed-timer baseline (switch every 10 steps) scores 0.81.
+    We can beat it by being smarter about WHEN to switch.
+    """
+    # During yellow, we can't do anything — return current pending or active
+    if obs.yellow_remaining > 0:
+        return obs.active_phase if obs.active_phase >= 0 else current_phase
+
+    # Emergency override: immediately switch to emergency corridor
+    if obs.emergency_direction >= 0:
+        d = obs.emergency_direction
+        target = 0 if d <= 1 else 1
+        if current_phase != target:
+            return target
+        return current_phase
+
+    # Compute axis loads (100m weighted heavily, 500m as future pressure)
+    ns_sn_100 = obs.ns_100m + obs.sn_100m
+    ew_we_100 = obs.ew_100m + obs.we_100m
+    ns_sn_500 = obs.ns_500m + obs.sn_500m
+    ew_we_500 = obs.ew_500m + obs.we_500m
+
+    ns_sn_load = ns_sn_100 + 0.3 * ns_sn_500
+    ew_we_load = ew_we_100 + 0.3 * ew_we_500
+
+    # Determine which corridor the current phase serves
+    current_green_dirs = get_green_dirs(current_phase)
+    serves_ns = any(d in [0, 1] for d in current_green_dirs)
+    serves_ew = any(d in [2, 3] for d in current_green_dirs)
+
+    current_load = 0.0
+    opposing_load = 0.0
+    if serves_ns and not serves_ew:
+        current_load = ns_sn_load
+        opposing_load = ew_we_load
+    elif serves_ew and not serves_ns:
+        current_load = ew_we_load
+        opposing_load = ns_sn_load
+    else:
+        # Phase serves both or neither — use corridor phases
+        current_load = ns_sn_load
+        opposing_load = ew_we_load
+
+    # Don't switch if we haven't held long enough
+    if time_in_phase < MIN_HOLD_TIME:
+        return current_phase
+
+    # Check if opposing axis is significantly busier
+    if opposing_load > 0 and current_load > 0:
+        ratio = opposing_load / max(current_load, 1.0)
+    elif opposing_load > 0:
+        ratio = 10.0  # Current axis is empty
+    else:
+        ratio = 0.0  # Opposing axis is empty
+
+    # Also factor in dilemma risk — if many heavy vehicles in green lanes, don't switch
+    dilemma_risk = estimate_dilemma_risk(obs, current_green_dirs)
+
+    # Adaptive threshold: require higher ratio if dilemma risk is high
+    effective_threshold = SWITCH_THRESHOLD + (dilemma_risk * 0.1)
+
+    if ratio >= effective_threshold:
+        # Switch to the opposing corridor
+        if serves_ns or (not serves_ew and ns_sn_load < ew_we_load):
+            # Check if one EW direction dominates — use single phase
+            if obs.ew_100m > 3 * obs.we_100m and obs.ew_100m > 10:
+                return 4  # EW only
+            elif obs.we_100m > 3 * obs.ew_100m and obs.we_100m > 10:
+                return 5  # WE only
+            return 1  # EW+WE corridor
+        else:
+            if obs.ns_100m > 3 * obs.sn_100m and obs.ns_100m > 10:
+                return 2  # NS only
+            elif obs.sn_100m > 3 * obs.ns_100m and obs.sn_100m > 10:
+                return 3  # SN only
+            return 0  # NS+SN corridor
+
+    # Check for very unbalanced single-direction loads within current axis
+    if serves_ns and time_in_phase >= MIN_HOLD_TIME + 4:
+        if obs.ns_100m > 3 * obs.sn_100m and obs.ns_100m > 15 and current_phase == 0:
+            return 2  # Focus on NS only
+        elif obs.sn_100m > 3 * obs.ns_100m and obs.sn_100m > 15 and current_phase == 0:
+            return 3  # Focus on SN only
+    elif serves_ew and time_in_phase >= MIN_HOLD_TIME + 4:
+        if obs.ew_100m > 3 * obs.we_100m and obs.ew_100m > 15 and current_phase == 1:
+            return 4
+        elif obs.we_100m > 3 * obs.ew_100m and obs.we_100m > 15 and current_phase == 1:
+            return 5
+
+    return current_phase
+
+
+# ---------------------------------------------------------------------------
 # Observation → LLM prompt
 # ---------------------------------------------------------------------------
 
@@ -142,15 +263,10 @@ def obs_to_summary(obs: Any) -> str:
         f"Total waiting: {obs.total_waiting}",
         f"Throughput so far: {obs.total_throughput}",
     ]
-    # Show heavy vehicle counts in 100m zone (dilemma risk factors)
-    v100 = obs.vehicles_100m
-    heavy = {d: 0 for d in range(4)}
-    dir_labels = ["NS", "SN", "EW", "WE"]
-    for vt in ("truck", "bus", "suv"):
-        for d in range(4):
-            heavy[d] += v100.get(vt, [0, 0, 0, 0])[d]
-    heavy_str = " ".join(f"{dir_labels[d]}:{heavy[d]}" for d in range(4))
-    lines.append(f"Heavy vehicles (truck+bus+suv) at 100m — {heavy_str}")
+    # Dilemma risk info
+    green_dirs = get_green_dirs(obs.active_phase)
+    dilemma = estimate_dilemma_risk(obs, green_dirs)
+    lines.append(f"Dilemma risk if switching now: {dilemma:.1f} vehicles")
     lines.append(f"Cumulative dilemma-zone vehicles: {obs.total_dilemma_vehicles:.1f}")
 
     if obs.emergency_direction >= 0:
@@ -163,6 +279,11 @@ def obs_to_summary(obs: Any) -> str:
             f"EMERGENCY vehicle in {dir_name} direction (use {phases_help}), "
             f"waiting {obs.emergency_wait} steps"
         )
+
+    # Heuristic recommendation
+    heuristic_rec = smart_heuristic(obs, obs.active_phase, obs.time_in_phase)
+    lines.append(f"\nHeuristic recommends: phase {heuristic_rec} ({phase_desc.get(heuristic_rec, '?')})")
+
     return "\n".join(lines)
 
 
@@ -178,7 +299,7 @@ def get_phase_from_llm(
     """Ask the LLM which phase to choose. Falls back to heuristic on failure."""
     user_prompt = obs_to_summary(obs)
     if history:
-        user_prompt += "\n\nRecent history:\n" + "\n".join(history[-5:])
+        user_prompt += "\n\nRecent actions:\n" + "\n".join(history[-5:])
     user_prompt += "\n\nChoose phase (0-5):"
 
     try:
@@ -199,24 +320,41 @@ def get_phase_from_llm(
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
 
-    return heuristic_phase(obs)
+    return smart_heuristic(obs, obs.active_phase, obs.time_in_phase)
 
 
-def heuristic_phase(obs: Any) -> int:
-    """Heuristic baseline: corridor for the busier axis, or target emergency."""
-    # Emergency: green the direction containing the emergency vehicle
+# ---------------------------------------------------------------------------
+# Hybrid decision: heuristic + periodic LLM consultation
+# ---------------------------------------------------------------------------
+
+def decide_phase(
+    client: OpenAI,
+    obs: Any,
+    history: List[str],
+    step: int,
+    current_phase: int,
+    time_in_phase: int,
+) -> int:
+    """
+    Hybrid approach:
+    - Use heuristic for most steps (fast, no API cost, avoids over-switching)
+    - Consult LLM every LLM_CONSULT_INTERVAL steps for strategic decisions
+    - Always use heuristic for emergency overrides
+    """
+    # During yellow, just hold
+    if obs.yellow_remaining > 0:
+        return current_phase
+
+    # Emergency: always use heuristic (fast, deterministic)
     if obs.emergency_direction >= 0:
-        d = obs.emergency_direction
-        # Use corridor if possible (0 for NS/SN, 1 for EW/WE)
-        if d <= 1:
-            return 0  # NS+SN corridor
-        else:
-            return 1  # EW+WE corridor
+        return smart_heuristic(obs, current_phase, time_in_phase)
 
-    # Compare NS+SN axis vs EW+WE axis (100m weighted 1.0, 500m weighted 0.3)
-    ns_sn = (obs.ns_100m + obs.sn_100m) + 0.3 * (obs.ns_500m + obs.sn_500m)
-    ew_we = (obs.ew_100m + obs.we_100m) + 0.3 * (obs.ew_500m + obs.we_500m)
-    return 0 if ns_sn >= ew_we else 1
+    # Consult LLM at strategic intervals when we might need to switch
+    if (step % LLM_CONSULT_INTERVAL == 0) and time_in_phase >= MIN_HOLD_TIME:
+        return get_phase_from_llm(client, obs, history)
+
+    # Default: use heuristic
+    return smart_heuristic(obs, current_phase, time_in_phase)
 
 
 # ---------------------------------------------------------------------------
@@ -236,14 +374,26 @@ async def run_task(client: OpenAI, env: TrafficLightEnv, task: str) -> Dict[str,
     try:
         result = await env.reset(task=task)
         obs = result.observation
+        current_phase = 0  # Start at NS+SN corridor
+        time_in_phase = 0
 
         for step in range(1, MAX_STEPS + 1):
             if result.done:
                 break
 
-            phase = get_phase_from_llm(client, obs, history)
-            action = TrafficLightAction(phase=phase)
+            phase = decide_phase(
+                client, obs, history, step,
+                current_phase, time_in_phase,
+            )
 
+            # Track phase timing locally
+            if phase != current_phase:
+                time_in_phase = 0
+                current_phase = phase
+            else:
+                time_in_phase += 1
+
+            action = TrafficLightAction(phase=phase)
             result = await env.step(action)
             obs = result.observation
 
@@ -263,7 +413,8 @@ async def run_task(client: OpenAI, env: TrafficLightEnv, task: str) -> Dict[str,
             )
 
             history.append(
-                f"Step {step}: phase={phase}, waiting={obs.total_waiting}, reward={reward:+.2f}"
+                f"Step {step}: phase={phase}, waiting={obs.total_waiting}, "
+                f"throughput={obs.total_throughput}, reward={reward:+.2f}"
             )
 
             if done:
@@ -315,6 +466,15 @@ async def main() -> None:
                 f"  [{status}] {r['task']:22s} score={r['score']:.4f} steps={r['steps']}",
                 flush=True,
             )
+            if r.get("grade_details"):
+                d = r["grade_details"]
+                print(
+                    f"           waiting={d.get('waiting_score', 0):.3f} "
+                    f"throughput={d.get('throughput_score', 0):.3f} "
+                    f"safety={d.get('safety_score', 0):.3f} "
+                    f"dilemma={d.get('total_dilemma_vehicles', 0):.1f}",
+                    flush=True,
+                )
         avg_score = (
             sum(r["score"] for r in all_results) / len(all_results)
             if all_results else 0.0
